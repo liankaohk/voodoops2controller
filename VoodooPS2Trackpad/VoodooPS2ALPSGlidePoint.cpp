@@ -52,9 +52,208 @@ bool IsItALPS(ALPSStatus_t *E6,ALPSStatus_t *E7);
 
 bool alps_hw_init_v7()
 {
-    if(alps_enter_command_mode
+    if (!enterCommandMode() || commandModeReadReg(0xc2d9) == -1) {
+        goto error;
+    }
+    
+    if (alps_get_v3_v7_resolution(psmouse, 0xc397))
+        goto error;
+    
+    if (!commandModeWriteReg(0xc2c9, 0x64))
+        goto error;
+    
+    reg_val = commandModeReadReg(0xc2c4);
+    if (reg_val == -1)
+        goto error;
+    if (!commandModeWriteReg(reg_val | 0x02))
+        goto error;
+    
+    exitCommandMode();
+    TPS2Request<1> request;
+    request.commands[0].command = kPS2C_SendMouseCommandAndCompareAck;
+    request.commands[0].inOrOut = kDP_Enable;
+    request.commandsCount = 1;
+    assert(request.commandsCount <= countof(request.commands));
+    _device->submitRequestAndBlock(&request);
+    return request.commandsCount == 1;
+    
+error:
+    exitCommandMode();
+    return ret;
 }
 
+bool ApplePS2ALPSGlidePoint::enterCommandMode() {
+    DEBUG_LOG("enter command mode\n");
+    TPS2Request<8> request;
+    ALPSStatus_t status;
+    
+    repeatCmd(NULL, NULL, kDP_MouseResetWrap, &status);
+    
+    IOLog("ApplePS2ALPSGlidePoint EC Report: { 0x%02x, 0x%02x, 0x%02x }\n", status.bytes[0], status.bytes[1], status.bytes[2]);
+    
+    if ((status.bytes[0] != 0x88 || (status.bytes[1] != 0x07 && status.bytes[1] != 0x08)) && status.bytes[0] != 0x73) {
+        DEBUG_LOG("ApplePS2ALPSGlidePoint: Failed to enter command mode!\n");
+        return false;
+    }
+    
+    return true;
+}
+
+bool ApplePS2ALPSGlidePoint::exitCommandMode() {
+    DEBUG_LOG("exit command mode\n");
+    TPS2Request<1> request;
+    
+    request.commands[0].command = kPS2C_SendMouseCommandAndCompareAck;
+    request.commands[0].inOrOut = kDP_SetMouseStreamMode;
+    request.commandsCount = 1;
+    assert(request.commandsCount <= countof(request.commands));
+    _device->submitRequestAndBlock(&request);
+    
+    return true;
+}
+       
+int ApplePS2ALPSGlidePoint::commandModeReadReg(int addr) {
+    TPS2Request<4> request;
+    ALPSStatus_t status;
+    
+    if (!commandModeSetAddr(addr)) {
+        DEBUG_LOG("Failed to set addr to read register\n");
+        return -1;
+    }
+    
+    request.commands[0].command = kPS2C_SendMouseCommandAndCompareAck;
+    request.commands[0].inOrOut = kDP_GetMouseInformation; //sync..
+    request.commands[1].command = kPS2C_ReadDataPort;
+    request.commands[1].inOrOut = 0;
+    request.commands[2].command = kPS2C_ReadDataPort;
+    request.commands[2].inOrOut = 0;
+    request.commands[3].command = kPS2C_ReadDataPort;
+    request.commands[3].inOrOut = 0;
+    request.commandsCount = 4;
+    assert(request.commandsCount <= countof(request.commands));
+    _device->submitRequestAndBlock(&request);
+    
+    if (request.commandsCount != 4) {
+        return -1;
+    }
+    
+    status.bytes[0] = request.commands[1].inOrOut;
+    status.bytes[1] = request.commands[2].inOrOut;
+    status.bytes[2] = request.commands[3].inOrOut;
+    
+    DEBUG_LOG("ApplePS2ALPSGlidePoint read reg result: { 0x%02x, 0x%02x, 0x%02x }\n", status.bytes[0], status.bytes[1], status.bytes[2]);
+    
+    /* The address being read is returned in the first 2 bytes
+     * of the result. Check that the address matches the expected
+     * address.
+     */
+    if (addr != ((status.bytes[0] << 8) | status.bytes[1])) {
+        DEBUG_LOG("ApplePS2ALPSGlidePoint ERROR: read wrong registry value, expected: %x\n", addr);
+        return -1;
+    }
+    
+    return status.bytes[2];
+}
+
+bool ApplePS2ALPSGlidePoint::commandModeWriteReg(int addr, UInt8 value) {
+    
+    if (!commandModeSetAddr(addr)) {
+        return false;
+    }
+    
+    return commandModeWriteReg(value);
+}
+
+bool ApplePS2ALPSGlidePoint::commandModeWriteReg(UInt8 value) {
+    if (!commandModeSendNibble((value >> 4) & 0xf)) {
+        return false;
+    }
+    if (!commandModeSendNibble(value & 0xf)) {
+        return false;
+    }
+    
+    return true;
+}
+
+bool ApplePS2ALPSGlidePoint::commandModeSendNibble(int nibble) {
+    SInt32 command;
+    // The largest amount of requests we will have is 2 right now
+    // 1 for the initial command, and 1 for sending data OR 1 for receiving data
+    // If the nibble commands at the top change then this will need to change as
+    // well. For now we will just validate that the request will not overload
+    // this object.
+    TPS2Request<2> request;
+    int cmdCount = 0, send = 0, receive = 0, i;
+    
+    if (nibble > 0xf) {
+        IOLog("%s::commandModeSendNibble ERROR: nibble value is greater than 0xf, command may fail\n", getName());
+    }
+    
+    request.commands[cmdCount].command = kPS2C_SendMouseCommandAndCompareAck;
+    command = modelData.nibble_commands[nibble].command;
+    request.commands[cmdCount++].inOrOut = command & 0xff;
+    
+    send = (command >> 12 & 0xf);
+    receive = (command >> 8 & 0xf);
+    
+    // Validate that the number of requests will not exceed our buffer as
+    // defined above
+    // Also, send can never be > 1 since all we have available is the data
+    // from the alps_nibble_commands which is 1 byte
+    if ((send > 1) || ((send + receive + 1) > 2)) {
+        IOLog("%s::commandModeSendNibble: ERROR: Nibble commands have changed. Cannot process nibble that sends or receives more than 1 byte of data.\n", getName());
+        return false;
+    }
+    
+    //DEBUG_LOG("%s: send nibble: nibble=%x command info=%x command=0x%02x send=%d, receive=%d, data=0x%02x\n",
+    //          getName(), nibble, command, request.commands[0].inOrOut, send, receive, modelData.nibble_commands[nibble].data);
+    
+    if (send > 0) {
+        request.commands[cmdCount].command = kPS2C_SendMouseCommandAndCompareAck;
+        request.commands[cmdCount++].inOrOut = modelData.nibble_commands[nibble].data;
+    }
+    
+    // Receive the amount of data for the given command
+    // Even though we don't read the data, we should drain the data port to follow protocol
+    for (i = 0; i < receive; i++) {
+        request.commands[cmdCount].command = kPS2C_ReadDataPort;
+        request.commands[cmdCount++].inOrOut = 0;
+    }
+    
+    request.commandsCount = cmdCount;
+    assert(request.commandsCount <= countof(request.commands));
+    
+    _device->submitRequestAndBlock(&request);
+    
+    //DEBUG_LOG("%s: num nibble commands=%d, expected=%d\n", getName(), request.commandsCount, cmdCount);
+    
+    return request.commandsCount == cmdCount;
+}
+
+bool ApplePS2ALPSGlidePoint::commandModeSetAddr(int addr) {
+    
+    TPS2Request<1> request;
+    int i, nibble;
+    
+    //    DEBUG_LOG("command mode set addr with addr command: 0x%02x\n", modelData.addr_command);
+    request.commands[0].command = kPS2C_SendMouseCommandAndCompareAck;
+    request.commands[0].inOrOut = modelData.addr_command;
+    request.commandsCount = 1;
+    _device->submitRequestAndBlock(&request);
+    
+    if (request.commandsCount != 1) {
+        return false;
+    }
+    
+    for (i = 12; i >= 0; i -= 4) {
+        nibble = (addr >> i) & 0xf;
+        if (!commandModeSendNibble(nibble)) {
+            return false;
+        }
+    }
+    
+    return true;
+}
 
 bool ApplePS2ALPSGlidePoint::init(OSDictionary * dict)
 {
