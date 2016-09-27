@@ -49,6 +49,13 @@ bool IsItALPS(ALPSStatus_t *E6,ALPSStatus_t *E7);
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+
+bool alps_hw_init_v7()
+{
+    if(alps_enter_command_mode
+}
+
+
 bool ApplePS2ALPSGlidePoint::init(OSDictionary * dict)
 {
     //
@@ -182,6 +189,21 @@ bool IsItALPS(ALPSStatus_t *E6,ALPSStatus_t *E7)
 			}
 		}
 	}
+    
+    #define NUM_V7S 1
+    static int alps_v7s[NUM_V7S] = {
+        0x00, 0x01, 0x02
+    };
+    
+    if (!success){
+        for (i = 0; i < NUM_V7S; ++i) {
+            if ((byte0 == apls_v7s[i * 3]) && (byte1 = alps_v7s[i*3 + 1]) &&
+                (byte2 == alps_v7s[i*3 + 2])) {
+                success = true;
+                break;
+            }
+        }
+    }
 	return success;
 }
 
